@@ -13,6 +13,8 @@ use x11_dl::xlib::{
     XDestroyWindowEvent, XEvent, XExposeEvent, XKeyEvent, XMapEvent, XPropertyEvent,
     XReparentEvent, XSelectionEvent, XVisibilityEvent, XkbAnyEvent, XkbStateRec,
 };
+#[cfg(feature = "x11-steam-overlay")]
+use x11_dl::xlib::XButtonEvent;
 use x11rb::protocol::xinput;
 use x11rb::protocol::xkb::ID as XkbId;
 use x11rb::protocol::xproto::{self, ConnectionExt as _, ModMask};
@@ -203,6 +205,15 @@ impl EventProcessor {
                 };
 
                 self.xinput_key_input(xev.as_mut(), state, &mut callback);
+            },
+            #[cfg(feature = "x11-steam-overlay")]
+            ty @ xlib::ButtonPress | ty @ xlib::ButtonRelease => {
+                let state = if ty == xlib::ButtonPress {
+                    ElementState::Pressed
+                } else {
+                    ElementState::Released
+                };
+                self.core_button_input(xev.as_ref(), state, &mut callback);
             },
             xlib::GenericEvent => {
                 let wt = Self::window_target(&self.target);
@@ -1044,6 +1055,74 @@ impl EventProcessor {
         callback(&self.target, event);
     }
 
+    fn pointer_button_event(
+        device_id: crate::event::DeviceId,
+        state: ElementState,
+        detail: u32,
+    ) -> WindowEvent {
+        match detail {
+            xlib::Button1 => {
+                WindowEvent::MouseInput { device_id, state, button: MouseButton::Left }
+            },
+            xlib::Button2 => {
+                WindowEvent::MouseInput { device_id, state, button: MouseButton::Middle }
+            },
+            xlib::Button3 => {
+                WindowEvent::MouseInput { device_id, state, button: MouseButton::Right }
+            },
+
+            // Suppress emulated scroll wheel clicks, since we handle the real motion events for
+            // those. In practice, even clicky scroll wheels appear to be reported by
+            // evdev (and XInput2 in turn) as axis motion, so we don't otherwise
+            // special-case these button presses.
+            4..=7 => WindowEvent::MouseWheel {
+                device_id,
+                delta: match detail {
+                    4 => MouseScrollDelta::LineDelta(0.0, 1.0),
+                    5 => MouseScrollDelta::LineDelta(0.0, -1.0),
+                    6 => MouseScrollDelta::LineDelta(1.0, 0.0),
+                    7 => MouseScrollDelta::LineDelta(-1.0, 0.0),
+                    _ => unreachable!(),
+                },
+                phase: TouchPhase::Moved,
+            },
+            8 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Back },
+            9 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Forward },
+            detail => WindowEvent::MouseInput {
+                device_id,
+                state,
+                button: MouseButton::Other(detail as u16),
+            },
+        }
+    }
+
+    #[cfg(feature = "x11-steam-overlay")]
+    fn core_button_input<T: 'static, F>(
+        &mut self,
+        event: &XButtonEvent,
+        state: ElementState,
+        mut callback: F,
+    ) where
+        F: FnMut(&RootAEL, Event<T>),
+    {
+        let window = event.window as xproto::Window;
+        if !self.window_exists(window) {
+            return;
+        }
+        Self::window_target(&self.target).xconn.set_timestamp(event.time as xproto::Timestamp);
+        let window_id = mkwid(window);
+        self.update_mods_from_core_event(window_id, event.state as u16, &mut callback);
+
+        // Core wheel buttons have a release event; one press is one wheel step.
+        if state == ElementState::Released && matches!(event.button, 4..=7) {
+            return;
+        }
+        // Core events name only X11's compatibility pointer, not the physical XI2 source.
+        let device_id = mkdid(util::VIRTUAL_CORE_POINTER);
+        let event = Self::pointer_button_event(device_id, state, event.button);
+        callback(&self.target, Event::WindowEvent { window_id, event });
+    }
+
     fn xinput2_button_input<T: 'static, F>(
         &self,
         event: &XIDeviceEvent,
@@ -1064,41 +1143,8 @@ impl EventProcessor {
             return;
         }
 
-        let event = match event.detail as u32 {
-            xlib::Button1 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Left }
-            },
-            xlib::Button2 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Middle }
-            },
-
-            xlib::Button3 => {
-                WindowEvent::MouseInput { device_id, state, button: MouseButton::Right }
-            },
-
-            // Suppress emulated scroll wheel clicks, since we handle the real motion events for
-            // those. In practice, even clicky scroll wheels appear to be reported by
-            // evdev (and XInput2 in turn) as axis motion, so we don't otherwise
-            // special-case these button presses.
-            4..=7 => WindowEvent::MouseWheel {
-                device_id,
-                delta: match event.detail {
-                    4 => MouseScrollDelta::LineDelta(0.0, 1.0),
-                    5 => MouseScrollDelta::LineDelta(0.0, -1.0),
-                    6 => MouseScrollDelta::LineDelta(1.0, 0.0),
-                    7 => MouseScrollDelta::LineDelta(-1.0, 0.0),
-                    _ => unreachable!(),
-                },
-                phase: TouchPhase::Moved,
-            },
-            8 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Back },
-
-            9 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Forward },
-            x => WindowEvent::MouseInput { device_id, state, button: MouseButton::Other(x as u16) },
-        };
-
-        let event = Event::WindowEvent { window_id, event };
-        callback(&self.target, event);
+        let event = Self::pointer_button_event(device_id, state, event.detail as u32);
+        callback(&self.target, Event::WindowEvent { window_id, event });
     }
 
     fn xinput2_mouse_motion<T: 'static, F>(&self, event: &XIDeviceEvent, mut callback: F)

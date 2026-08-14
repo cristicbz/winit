@@ -257,10 +257,9 @@ impl UnownedWindow {
             };
         let mut visual = visualtype.map_or(x11rb::COPY_FROM_PARENT, |v| v.visual_id);
 
-        let window_attributes = {
+        let (window_attributes, change_attributes) = {
             use xproto::EventMask;
 
-            let mut aux = xproto::CreateWindowAux::new();
             let event_mask = EventMask::EXPOSURE
                 | EventMask::STRUCTURE_NOTIFY
                 | EventMask::VISIBILITY_CHANGE
@@ -271,11 +270,14 @@ impl UnownedWindow {
                 | EventMask::BUTTON_RELEASE
                 | EventMask::POINTER_MOTION
                 | EventMask::PROPERTY_CHANGE;
-
-            aux = aux.event_mask(event_mask).border_pixel(0);
+            let mut create =
+                xproto::CreateWindowAux::new().event_mask(event_mask).border_pixel(0);
+            let mut change =
+                xproto::ChangeWindowAttributesAux::new().event_mask(event_mask).border_pixel(0);
 
             if window_attrs.platform_specific.x11.override_redirect {
-                aux = aux.override_redirect(true as u32);
+                create = create.override_redirect(true as u32);
+                change = change.override_redirect(true as u32);
             }
 
             // Add a colormap if needed.
@@ -285,7 +287,7 @@ impl UnownedWindow {
                 _ => None,
             };
 
-            if let Some(visual) = colormap_visual {
+            let colormap = if let Some(visual) = colormap_visual {
                 let colormap = leap!(xconn.xcb_connection().generate_id());
                 leap!(xconn.xcb_connection().create_colormap(
                     xproto::ColormapAlloc::NONE,
@@ -293,37 +295,76 @@ impl UnownedWindow {
                     root,
                     visual,
                 ));
-                aux = aux.colormap(colormap);
+                colormap
             } else {
-                aux = aux.colormap(0);
-            }
+                0
+            };
 
-            aux
+            (create.colormap(colormap), change.colormap(colormap))
         };
 
         // Figure out the window's parent.
         let parent = window_attrs.platform_specific.x11.embed_window.unwrap_or(root);
 
-        // finally creating the window
+        // Finally create the window. x11rb serializes CreateWindow through xcb_send_request,
+        // bypassing the creation entry points Steam interposes. The opt-in path exposes only
+        // creation to Steam while retaining the shared XCB connection for everything else.
         let xwindow = {
             let (x, y) = position.map_or((0, 0), Into::into);
-            let wid = leap!(xconn.xcb_connection().generate_id());
-            let result = xconn.xcb_connection().create_window(
-                depth,
-                wid,
-                parent,
-                x,
-                y,
-                dimensions.0.try_into().unwrap(),
-                dimensions.1.try_into().unwrap(),
-                0,
-                xproto::WindowClass::INPUT_OUTPUT,
-                visual,
-                &window_attributes,
-            );
-            leap!(leap!(result).check());
+            let use_xlib = cfg!(feature = "x11-steam-overlay")
+                && parent == root
+                && visual == x11rb::COPY_FROM_PARENT;
 
-            wid
+            if use_xlib {
+                let xwindow = unsafe {
+                    (xconn.xlib.XCreateSimpleWindow)(
+                        xconn.display,
+                        c_ulong::from(parent),
+                        x,
+                        y,
+                        dimensions.0,
+                        dimensions.1,
+                        0,
+                        0,
+                        0,
+                    )
+                };
+                let xwindow = u32::try_from(xwindow).expect("an X11 window id fits u32");
+
+                // Flush before x11rb starts configuring the new window on the shared connection.
+                unsafe {
+                    (xconn.xlib.XFlush)(xconn.display);
+                }
+                let result =
+                    xconn.xcb_connection().change_window_attributes(xwindow, &change_attributes);
+                leap!(leap!(result).check());
+
+                info!("Created X11 window 0x{xwindow:x} through Xlib for Steam overlay support");
+                xwindow
+            } else {
+                if cfg!(feature = "x11-steam-overlay") && parent == root {
+                    warn!(
+                        "Steam overlay-compatible X11 creation requires the default visual; \
+                         falling back to x11rb for visual 0x{visual:x}"
+                    );
+                }
+                let xwindow = leap!(xconn.xcb_connection().generate_id());
+                let result = xconn.xcb_connection().create_window(
+                    depth,
+                    xwindow,
+                    parent,
+                    x.try_into().unwrap(),
+                    y.try_into().unwrap(),
+                    dimensions.0.try_into().unwrap(),
+                    dimensions.1.try_into().unwrap(),
+                    0,
+                    xproto::WindowClass::INPUT_OUTPUT,
+                    visual,
+                    &window_attributes,
+                );
+                leap!(leap!(result).check());
+                xwindow
+            }
         };
 
         // The COPY_FROM_PARENT is a special value for the visual used to copy
@@ -489,10 +530,10 @@ impl UnownedWindow {
             );
             leap!(result).ignore_error();
 
-            // Select XInput2 events
-            let mask = xinput::XIEventMask::MOTION
-                | xinput::XIEventMask::BUTTON_PRESS
-                | xinput::XIEventMask::BUTTON_RELEASE
+            // Cooked XInput2 button selection prevents Steam from receiving the core button
+            // events its Linux overlay consumes. Keep XI2 motion and the other window events;
+            // the opt-in path handles only core buttons.
+            let mut mask = xinput::XIEventMask::MOTION
                 | xinput::XIEventMask::ENTER
                 | xinput::XIEventMask::LEAVE
                 | xinput::XIEventMask::FOCUS_IN
@@ -500,6 +541,9 @@ impl UnownedWindow {
                 | xinput::XIEventMask::TOUCH_BEGIN
                 | xinput::XIEventMask::TOUCH_UPDATE
                 | xinput::XIEventMask::TOUCH_END;
+            if !cfg!(feature = "x11-steam-overlay") {
+                mask |= xinput::XIEventMask::BUTTON_PRESS | xinput::XIEventMask::BUTTON_RELEASE;
+            }
             leap!(xconn.select_xinput_events(window.xwindow, super::ALL_MASTER_DEVICES, mask))
                 .ignore_error();
 
