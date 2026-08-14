@@ -257,10 +257,11 @@ impl UnownedWindow {
             };
         let mut visual = visualtype.map_or(x11rb::COPY_FROM_PARENT, |v| v.visual_id);
 
-        let window_attributes = {
+        let (window_attributes, change_attributes, event_mask) = {
             use xproto::EventMask;
 
             let mut aux = xproto::CreateWindowAux::new();
+            let mut change = xproto::ChangeWindowAttributesAux::new();
             let event_mask = EventMask::EXPOSURE
                 | EventMask::STRUCTURE_NOTIFY
                 | EventMask::VISIBILITY_CHANGE
@@ -273,9 +274,11 @@ impl UnownedWindow {
                 | EventMask::PROPERTY_CHANGE;
 
             aux = aux.event_mask(event_mask).border_pixel(0);
+            change = change.event_mask(event_mask).border_pixel(0);
 
             if window_attrs.platform_specific.x11.override_redirect {
                 aux = aux.override_redirect(true as u32);
+                change = change.override_redirect(true as u32);
             }
 
             // Add a colormap if needed.
@@ -294,11 +297,13 @@ impl UnownedWindow {
                     visual,
                 ));
                 aux = aux.colormap(colormap);
+                change = change.colormap(colormap);
             } else {
                 aux = aux.colormap(0);
+                change = change.colormap(0);
             }
 
-            aux
+            (aux, change, event_mask)
         };
 
         // Figure out the window's parent.
@@ -307,21 +312,106 @@ impl UnownedWindow {
         // finally creating the window
         let xwindow = {
             let (x, y) = position.map_or((0, 0), Into::into);
-            let wid = leap!(xconn.xcb_connection().generate_id());
-            let result = xconn.xcb_connection().create_window(
-                depth,
-                wid,
-                parent,
-                x,
-                y,
-                dimensions.0.try_into().unwrap(),
-                dimensions.1.try_into().unwrap(),
-                0,
-                xproto::WindowClass::INPUT_OUTPUT,
-                visual,
-                &window_attributes,
-            );
-            leap!(leap!(result).check());
+            let mut wid = leap!(xconn.xcb_connection().generate_id());
+
+            // LOCAL PATCH (Steam overlay): x11rb marshals the CreateWindow request itself and
+            // sends it through `xcb_send_request`, so it calls neither Xlib's `XCreateWindow`
+            // nor libxcb's `xcb_create_window` wrapper. Steam's `gameoverlayrenderer.so`
+            // discovers game windows by interposing those, and only the *Xlib* one was observed
+            // to establish tracking, so create through Xlib when the visual allows it
+            // (`COPY_FROM_PARENT`, which is winit's own default without transparency) and apply
+            // the attributes immediately afterwards.
+            let created_via_libxcb = unsafe {
+                let xlib_create = libc::dlsym(libc::RTLD_DEFAULT, c"XCreateWindow".as_ptr());
+                if xlib_create.is_null() || visual != x11rb::COPY_FROM_PARENT {
+                    eprintln!(
+                        "winit[steam-overlay-patch]: falling back to x11rb (symbol {}, visual {visual})",
+                        if xlib_create.is_null() { "missing" } else { "present" }
+                    );
+                    false
+                } else {
+                    type XCreateWindow = unsafe extern "C" fn(
+                        *mut std::ffi::c_void,
+                        std::ffi::c_ulong,
+                        std::ffi::c_int,
+                        std::ffi::c_int,
+                        std::ffi::c_uint,
+                        std::ffi::c_uint,
+                        std::ffi::c_uint,
+                        std::ffi::c_int,
+                        std::ffi::c_uint,
+                        *mut std::ffi::c_void,
+                        std::ffi::c_ulong,
+                        *mut std::ffi::c_void,
+                    ) -> std::ffi::c_ulong;
+                    let create: XCreateWindow = std::mem::transmute(xlib_create);
+                    // depth 0 / visual NULL / class 1 = CopyFromParent, InputOutput.
+                    let created = create(
+                        xconn.display.cast(),
+                        parent as std::ffi::c_ulong,
+                        x as std::ffi::c_int,
+                        y as std::ffi::c_int,
+                        dimensions.0 as std::ffi::c_uint,
+                        dimensions.1 as std::ffi::c_uint,
+                        0,
+                        0,
+                        1,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                    );
+                    // Select the same events through Xlib's (also interposed) `XSelectInput`.
+                    // The overlay records the event mask it *sees* at this point and uses it to
+                    // decide how to route input; setting the mask through x11rb alone leaves it
+                    // believing the window wants no events, which renders the overlay but sends
+                    // it no clicks. Same client and same mask winit sets moments later, so this
+                    // changes nothing about the game's own input.
+                    let select_input = libc::dlsym(libc::RTLD_DEFAULT, c"XSelectInput".as_ptr());
+                    if !select_input.is_null() {
+                        type XSelectInput = unsafe extern "C" fn(
+                            *mut std::ffi::c_void,
+                            std::ffi::c_ulong,
+                            std::ffi::c_long,
+                        ) -> std::ffi::c_int;
+                        let select: XSelectInput = std::mem::transmute(select_input);
+                        select(
+                            xconn.display.cast(),
+                            created,
+                            u32::from(event_mask) as std::ffi::c_long,
+                        );
+                    }
+                    // Flush so Xlib's requests reach the server before x11rb sends more on the
+                    // connection they share.
+                    (xconn.xlib.XFlush)(xconn.display);
+                    eprintln!(
+                        "winit[steam-overlay-patch]: created window 0x{created:x} via Xlib \
+                         XCreateWindow (x11rb would have used 0x{wid:x})"
+                    );
+                    wid = created as u32;
+                    true
+                }
+            };
+            if created_via_libxcb {
+                leap!(leap!(xconn
+                    .xcb_connection()
+                    .change_window_attributes(wid, &change_attributes))
+                .check());
+            } else {
+                let result = xconn.xcb_connection().create_window(
+                    depth,
+                    wid,
+                    parent,
+                    x,
+                    y,
+                    dimensions.0.try_into().unwrap(),
+                    dimensions.1.try_into().unwrap(),
+                    0,
+                    xproto::WindowClass::INPUT_OUTPUT,
+                    visual,
+                    &window_attributes,
+                );
+                leap!(leap!(result).check());
+            }
 
             wid
         };
