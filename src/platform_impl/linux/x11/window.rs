@@ -311,87 +311,65 @@ impl UnownedWindow {
 
         // finally creating the window
         let xwindow = {
-            let (x, y) = position.map_or((0, 0), Into::into);
+            let (x, y): (i16, i16) = position.map_or((0, 0), Into::into);
             let mut wid = leap!(xconn.xcb_connection().generate_id());
 
-            // LOCAL PATCH (Steam overlay): x11rb marshals the CreateWindow request itself and
-            // sends it through `xcb_send_request`, so it calls neither Xlib's `XCreateWindow`
-            // nor libxcb's `xcb_create_window` wrapper. Steam's `gameoverlayrenderer.so`
-            // discovers game windows by interposing those, and only the *Xlib* one was observed
-            // to establish tracking, so create through Xlib when the visual allows it
-            // (`COPY_FROM_PARENT`, which is winit's own default without transparency) and apply
-            // the attributes immediately afterwards.
-            let created_via_libxcb = unsafe {
-                let xlib_create = libc::dlsym(libc::RTLD_DEFAULT, c"XCreateWindow".as_ptr());
-                if xlib_create.is_null() || visual != x11rb::COPY_FROM_PARENT {
-                    eprintln!(
-                        "winit[steam-overlay-patch]: falling back to x11rb (symbol {}, visual {visual})",
-                        if xlib_create.is_null() { "missing" } else { "present" }
-                    );
-                    false
-                } else {
-                    type XCreateWindow = unsafe extern "C" fn(
-                        *mut std::ffi::c_void,
-                        std::ffi::c_ulong,
-                        std::ffi::c_int,
-                        std::ffi::c_int,
-                        std::ffi::c_uint,
-                        std::ffi::c_uint,
-                        std::ffi::c_uint,
-                        std::ffi::c_int,
-                        std::ffi::c_uint,
-                        *mut std::ffi::c_void,
-                        std::ffi::c_ulong,
-                        *mut std::ffi::c_void,
-                    ) -> std::ffi::c_ulong;
-                    let create: XCreateWindow = std::mem::transmute(xlib_create);
-                    // depth 0 / visual NULL / class 1 = CopyFromParent, InputOutput.
-                    let created = create(
-                        xconn.display.cast(),
-                        parent as std::ffi::c_ulong,
-                        x as std::ffi::c_int,
-                        y as std::ffi::c_int,
-                        dimensions.0 as std::ffi::c_uint,
-                        dimensions.1 as std::ffi::c_uint,
-                        0,
-                        0,
-                        1,
-                        std::ptr::null_mut(),
-                        0,
-                        std::ptr::null_mut(),
-                    );
-                    // Select the same events through Xlib's (also interposed) `XSelectInput`.
-                    // The overlay records the event mask it *sees* at this point and uses it to
-                    // decide how to route input; setting the mask through x11rb alone leaves it
-                    // believing the window wants no events, which renders the overlay but sends
-                    // it no clicks. Same client and same mask winit sets moments later, so this
-                    // changes nothing about the game's own input.
-                    let select_input = libc::dlsym(libc::RTLD_DEFAULT, c"XSelectInput".as_ptr());
-                    if !select_input.is_null() {
-                        type XSelectInput = unsafe extern "C" fn(
-                            *mut std::ffi::c_void,
-                            std::ffi::c_ulong,
-                            std::ffi::c_long,
-                        ) -> std::ffi::c_int;
-                        let select: XSelectInput = std::mem::transmute(select_input);
-                        select(
-                            xconn.display.cast(),
-                            created,
-                            u32::from(event_mask) as std::ffi::c_long,
-                        );
-                    }
-                    // Flush so Xlib's requests reach the server before x11rb sends more on the
-                    // connection they share.
-                    (xconn.xlib.XFlush)(xconn.display);
-                    eprintln!(
-                        "winit[steam-overlay-patch]: created window 0x{created:x} via Xlib \
-                         XCreateWindow (x11rb would have used 0x{wid:x})"
-                    );
-                    wid = created as u32;
-                    true
+            // LOCAL PATCH (Steam overlay): `gameoverlayrenderer.so` learns of a game window
+            // only inside its interposed `XCreateWindow`, binds the window to the display
+            // connection that call named, and — once the overlay is open — receives mouse
+            // input exclusively by stealing core button events from *that connection's* Xlib
+            // event pump. Stock winit can offer it none of that: x11rb marshals CreateWindow
+            // itself (no interposable call), x11-dl resolves libX11 through `dlsym` on a
+            // private handle (real functions, so winit's own `XCheckIfEvent` pump is invisible
+            // to the interposer), and winit's pointer input is XInput2, whose GenericEvents
+            // the overlay ignores. So when the overlay is present, create the window through
+            // the interposed `XCreateWindow` on a dedicated side connection (opened through
+            // the interposed `XOpenDisplay`), select the classic core event mask there —
+            // including the exclusive core button bits, which winit's own selection below
+            // therefore must not claim — and pump that connection forever. The overlay then
+            // sees an ordinary Xlib game: one visible connection that created the window,
+            // selected its input, and pumps its events; the game's real input (XInput2
+            // buttons, core keys, on winit's invisible connection) is untouched. A window is
+            // a server-side object, so winit operating on a window another connection created
+            // is ordinary X11; the side connection is never closed, so the window's lifetime
+            // is unaffected.
+            let created_on_side_connection = 'side: {
+                if visual != x11rb::COPY_FROM_PARENT {
+                    // A custom visual (transparency) keeps the stock path; the overlay loses
+                    // this window, which beats rendering it wrong.
+                    break 'side false;
                 }
+                let Some(side) = steam_overlay::connection() else {
+                    break 'side false;
+                };
+                let window = side.create_window(
+                    parent as std::ffi::c_ulong,
+                    x.into(),
+                    y.into(),
+                    dimensions.0,
+                    dimensions.1,
+                    u32::from(event_mask) as std::ffi::c_long,
+                );
+                if window == 0 {
+                    break 'side false;
+                }
+                eprintln!(
+                    "winit[steam-overlay-patch]: window 0x{window:x} created and selected on \
+                     the overlay-visible side connection (x11rb would have used 0x{wid:x})"
+                );
+                wid = window as u32;
+                true
             };
-            if created_via_libxcb {
+            if created_on_side_connection {
+                // winit's own selection must not claim the exclusive core button bits — the
+                // side connection holds them (one client per window), and the game's clicks
+                // arrive through XInput2 regardless.
+                let change_attributes = change_attributes.event_mask(xproto::EventMask::from(
+                    u32::from(event_mask)
+                        & !u32::from(
+                            xproto::EventMask::BUTTON_PRESS | xproto::EventMask::BUTTON_RELEASE,
+                        ),
+                ));
                 leap!(leap!(xconn
                     .xcb_connection()
                     .change_window_attributes(wid, &change_attributes))
@@ -2024,5 +2002,168 @@ fn cast_size_to_hint(size: Size, scale_factor: f64) -> (i32, i32) {
     match size {
         Size::Physical(size) => cast_physical_size_to_hint(size),
         Size::Logical(size) => size.to_physical::<i32>(scale_factor).into(),
+    }
+}
+
+/// LOCAL PATCH (Steam overlay): the one display connection `gameoverlayrenderer.so` is shown.
+/// See the comment at the `XCreateWindow` call site in `UnownedWindow::new`.
+///
+/// Every entry point is resolved with `dlsym(RTLD_DEFAULT, …)` so the *interposed* copies from
+/// the overlay's `LD_PRELOAD` win over libX11's own; the connection is opened at all only when
+/// that library is actually mapped (`WINIT_NO_STEAM_OVERLAY_FIX=1` opts out). The pump thread
+/// exists because the interposer harvests input by watching the events the game pulls through
+/// `XPending`/`XNextEvent` on the window's connection: every event drained here is a copy the
+/// game never needed, but each one passes through the interposer, which is the point.
+mod steam_overlay {
+    use std::ffi::{c_char, c_int, c_long, c_ulong, c_void, CStr};
+    use std::sync::{Once, OnceLock};
+
+    pub struct Connection {
+        display: *mut c_void,
+        create: unsafe extern "C" fn(
+            *mut c_void,
+            c_ulong,
+            c_int,
+            c_int,
+            std::ffi::c_uint,
+            std::ffi::c_uint,
+            std::ffi::c_uint,
+            c_int,
+            std::ffi::c_uint,
+            *mut c_void,
+            c_ulong,
+            *mut c_void,
+        ) -> c_ulong,
+        select: unsafe extern "C" fn(*mut c_void, c_ulong, c_long) -> c_int,
+        sync: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
+        pending: unsafe extern "C" fn(*mut c_void) -> c_int,
+        next_event: unsafe extern "C" fn(*mut c_void, *mut [c_long; 24]) -> c_int,
+        pump: Once,
+    }
+
+    // SAFETY: the display is used from the creating thread and the pump thread; winit put Xlib
+    // in threaded mode (`XInitThreads`, before any connection existed) so concurrent calls on
+    // one display take its lock.
+    unsafe impl Sync for Connection {}
+    unsafe impl Send for Connection {}
+
+    /// The overlay-visible connection, opened once, or `None` when there is no overlay to show
+    /// it to (or the escape hatch is set, or Xlib is unavailable).
+    pub fn connection() -> Option<&'static Connection> {
+        static CONNECTION: OnceLock<Option<Connection>> = OnceLock::new();
+        CONNECTION.get_or_init(open).as_ref()
+    }
+
+    fn open() -> Option<Connection> {
+        if std::env::var_os("WINIT_NO_STEAM_OVERLAY_FIX").is_some() {
+            return None;
+        }
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+        if !maps.contains("gameoverlayrenderer.so") {
+            return None;
+        }
+        // SAFETY: transmutes reinterpret non-null `dlsym` results as the C signatures the
+        // symbols are documented to have; `XOpenDisplay(NULL)` opens an independent connection.
+        unsafe {
+            let open_display: unsafe extern "C" fn(*const c_char) -> *mut c_void =
+                std::mem::transmute(resolve(c"XOpenDisplay")?);
+            let connection = Connection {
+                display: std::ptr::null_mut(),
+                create: std::mem::transmute(resolve(c"XCreateWindow")?),
+                select: std::mem::transmute(resolve(c"XSelectInput")?),
+                sync: std::mem::transmute(resolve(c"XSync")?),
+                pending: std::mem::transmute(resolve(c"XPending")?),
+                next_event: std::mem::transmute(resolve(c"XNextEvent")?),
+                pump: Once::new(),
+            };
+            let display = open_display(std::ptr::null());
+            if display.is_null() {
+                eprintln!(
+                    "winit[steam-overlay-patch]: XOpenDisplay failed for the side connection"
+                );
+                return None;
+            }
+            eprintln!("winit[steam-overlay-patch]: side connection open at {display:p}");
+            Some(Connection { display, ..connection })
+        }
+    }
+
+    fn resolve(name: &CStr) -> Option<*mut c_void> {
+        // SAFETY: `dlsym` with a valid C string.
+        let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        if address.is_null() {
+            eprintln!("winit[steam-overlay-patch]: {} is not resolvable", name.to_string_lossy());
+        }
+        (!address.is_null()).then_some(address)
+    }
+
+    impl Connection {
+        /// Creates the window through the interposed `XCreateWindow` (CopyFromParent depth and
+        /// visual, InputOutput), selects `event_mask` on it here, round-trips so the window
+        /// exists server-side before winit's own connection references the id, and starts the
+        /// pump. Returns 0 on failure (X errors on this connection are asynchronous; a failed
+        /// create surfaces as the caller's requests failing on a bad id, which the stock path's
+        /// error handling reports).
+        pub fn create_window(
+            &'static self,
+            parent: c_ulong,
+            x: i32,
+            y: i32,
+            width: u32,
+            height: u32,
+            event_mask: c_long,
+        ) -> c_ulong {
+            // SAFETY: a live display; depth 0 / visual NULL / class 1 = CopyFromParent,
+            // InputOutput; the attribute mask is empty so the attribute pointer is unused.
+            let window = unsafe {
+                (self.create)(
+                    self.display,
+                    parent,
+                    x,
+                    y,
+                    width,
+                    height,
+                    0,
+                    0,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if window == 0 {
+                return 0;
+            }
+            // SAFETY: as above; `XSync` discards nothing (second argument False).
+            unsafe {
+                (self.select)(self.display, window, event_mask);
+                (self.sync)(self.display, 0);
+            }
+            self.start_pump();
+            window
+        }
+
+        fn start_pump(&'static self) {
+            self.pump.call_once(|| {
+                let spawned = std::thread::Builder::new()
+                    .name("steam-overlay-pump".to_owned())
+                    .spawn(move || {
+                        let mut event = [0 as c_long; 24];
+                        loop {
+                            // SAFETY: threaded-mode display; `XPending > 0` guarantees
+                            // `XNextEvent` does not block.
+                            unsafe {
+                                while (self.pending)(self.display) > 0 {
+                                    (self.next_event)(self.display, &mut event);
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                    });
+                if spawned.is_err() {
+                    eprintln!("winit[steam-overlay-patch]: could not spawn the pump thread");
+                }
+            });
+        }
     }
 }
