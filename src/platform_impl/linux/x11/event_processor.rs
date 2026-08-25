@@ -14,7 +14,7 @@ use x11_dl::xlib::{
     XReparentEvent, XSelectionEvent, XVisibilityEvent, XkbAnyEvent, XkbStateRec,
 };
 #[cfg(feature = "x11-steam-overlay")]
-use x11_dl::xlib::XButtonEvent;
+use x11_dl::xlib::{XButtonEvent, XMotionEvent};
 use x11rb::protocol::xinput;
 use x11rb::protocol::xkb::ID as XkbId;
 use x11rb::protocol::xproto::{self, ConnectionExt as _, ModMask};
@@ -215,6 +215,8 @@ impl EventProcessor {
                 };
                 self.core_button_input(xev.as_ref(), state, &mut callback);
             },
+            #[cfg(feature = "x11-steam-overlay")]
+            xlib::MotionNotify => self.core_mouse_motion(xev.as_ref(), &mut callback),
             xlib::GenericEvent => {
                 let wt = Self::window_target(&self.target);
                 let xev: GenericEventCookie =
@@ -1121,6 +1123,56 @@ impl EventProcessor {
         let device_id = mkdid(util::VIRTUAL_CORE_POINTER);
         let event = Self::pointer_button_event(device_id, state, event.button);
         callback(&self.target, Event::WindowEvent { window_id, event });
+    }
+
+    /// Core pointer motion. A core button press establishes an implicit core grab, and for as
+    /// long as it lasts the server sends core motion in place of the XInput2 motion this backend
+    /// otherwise runs on — so without this, the pointer position freezes for the length of every
+    /// drag. Only motion with a button down is taken: outside a grab, XI2 motion is the finer
+    /// (subpixel) source and stays the one that speaks.
+    ///
+    /// The core modifier mask names buttons 1-5 and no others, so a drag with button 6 or above
+    /// still freezes. Reading the mask keeps this in step with the server; counting presses
+    /// ourselves would cover every button but could be left stuck by a release delivered
+    /// elsewhere, and would then take core motion outside any grab too — where XI2 motion is
+    /// still arriving, so every move would be reported twice, once rounded and once not.
+    #[cfg(feature = "x11-steam-overlay")]
+    fn core_mouse_motion<T: 'static, F>(&self, event: &XMotionEvent, mut callback: F)
+    where
+        F: FnMut(&RootAEL, Event<T>),
+    {
+        const BUTTONS_HELD: std::os::raw::c_uint = xlib::Button1Mask
+            | xlib::Button2Mask
+            | xlib::Button3Mask
+            | xlib::Button4Mask
+            | xlib::Button5Mask;
+
+        if event.state & BUTTONS_HELD == 0 {
+            return;
+        }
+        let window = event.window as xproto::Window;
+        if !self.window_exists(window) {
+            return;
+        }
+        Self::window_target(&self.target).xconn.set_timestamp(event.time as xproto::Timestamp);
+
+        let position = PhysicalPosition::new(event.x as f64, event.y as f64);
+        let cursor_moved = self.with_window(window, |window| {
+            let mut shared_state_lock = window.shared_state_lock();
+            util::maybe_change(&mut shared_state_lock.cursor_pos, (position.x, position.y))
+        });
+        if cursor_moved != Some(true) {
+            return;
+        }
+
+        let event = Event::WindowEvent {
+            window_id: mkwid(window),
+            event: WindowEvent::CursorMoved {
+                device_id: mkdid(util::VIRTUAL_CORE_POINTER),
+                position,
+            },
+        };
+        callback(&self.target, event);
     }
 
     fn xinput2_button_input<T: 'static, F>(
